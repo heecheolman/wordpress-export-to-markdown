@@ -53,36 +53,68 @@ function parseFileContent(content) {
 	xml2js.parseString(content, processors, (err, data) => {
 		if (err) {
 			console.log('Unable to parse file content.');
-			console.log(err);        
+			console.log(err);
 		} else {
 			processData(data);
 		}
 	});
 }
 
+function categorize(data, posts) {
+	let categorized = {};
+	let categories = [];
+
+	posts.forEach(post => {
+		categorized[post.meta.id] = {
+			post: post,
+			category: null,
+		};
+	});
+
+	data.rss.channel[0].item.forEach(item => {
+		const postId = item.post_id[0];
+		// console.log(postId);
+		if (item.category) {
+			const meta = item.category;
+			for(let i = 0; i < meta.length; i++) {
+				if (meta[i].hasOwnProperty('$') && meta[i]['$'].domain === 'category') {
+					categorized[postId].category = meta[i]._;
+				}
+			}
+		}
+	});
+
+	return categorized;
+}
+
 function processData(data) {
 	let images = collectImages(data);
 	let posts = collectPosts(data);
+	let categories = [];
 	mergeImagesIntoPosts(images, posts);
-	writeFiles(posts);
+	const categorizedData = categorize(data, posts);
+	writeFiles(categorizedData);
 }
 
 function collectImages(data) {
 	// start by collecting all attachment images
 	let images = getItemsOfType(data, 'attachment')
 		// filter to certain image file types
-		.filter(attachment => (/\.(gif|jpg|png)$/i).test(attachment.attachment_url[0]))
-		.map(attachment => ({
-			id: attachment.post_id[0],
-			postId: attachment.post_parent[0],
-			url: attachment.attachment_url[0]
-		}));
+		.filter(attachment => {
+			return (/\.(gif|jpg|png)$/i).test(attachment.attachment_url[0])
+		})
+		.map(attachment => {
+			return ({
+				id: attachment.post_id[0],
+				postId: attachment.post_parent[0],
+				url: attachment.attachment_url[0]
+			})
+		});
 
 	// optionally add images scraped from <img> tags in post content
 	if (argv.addcontentimages) {
 		addContentImages(data, images);
 	}
-
 	return images;
 }
 
@@ -97,10 +129,10 @@ function addContentImages(data, images) {
 
 		// reset lastIndex since we're reusing the same regex object
 		regex.lastIndex = 0;
+
 		while ((match = regex.exec(postContent)) !== null) {
 			// base the matched image URL relative to the post URL
-			let url = new URL(match[1], postLink).href;
-
+			let url = match[1];
 			// add image if it hasn't already been added for this post
 			let exists = images.some(image => image.postId === postId && image.url === url);
 			if (!exists) {
@@ -112,13 +144,12 @@ function addContentImages(data, images) {
 				console.log('Scraped ' + url + '.');
 			}
 		}
-	});	
+	});
 }
 
 function collectPosts(data) {
 	// this is passed into getPostContent() for the markdown conversion
 	turndownService = initTurndownService();
-
 	return getItemsOfType(data, 'post')
 		.map(post => ({
 			// meta data isn't written to file, but is used to help with other things
@@ -155,13 +186,13 @@ function initTurndownService() {
 			// but this series of checks should find the commonalities
 			return (
 				['P', 'DIV'].includes(node.nodeName) &&
-				node.attributes['data-slug-hash'] && 
+				node.attributes['data-slug-hash'] &&
 				node.getAttribute('class') === 'codepen'
 			);
 		},
 		replacement: (content, node) => '\n\n' + node.outerHTML
 	});
-		
+
 	// preserve embedded scripts (for tweets, codepens, gists, etc.)
 	turndownService.addRule('script', {
 		filter: 'script',
@@ -218,7 +249,6 @@ function getPostDate(post) {
 
 function getPostContent(post, turndownService) {
 	let content = post.encoded[0].trim();
-
 	// insert an empty div element between double line breaks
 	// this nifty trick causes turndown to keep adjacent paragraphs separated
 	// without mucking up content inside of other elemnts (like <code> blocks)
@@ -243,7 +273,6 @@ function getPostContent(post, turndownService) {
 
 	// clean up the "." from the iframe hack above
 	content = content.replace(/\.(<\/iframe>)/gi, '$1');
-
 	return content;
 }
 
@@ -259,6 +288,7 @@ function mergeImagesIntoPosts(images, posts) {
 		if (post) {
 			// save full image URLs for downloading later
 			post.meta.imageUrls = post.meta.imageUrls || [];
+
 			post.meta.imageUrls.push(image.url);
 
 			if (image.id === post.meta.coverImageId) {
@@ -269,20 +299,32 @@ function mergeImagesIntoPosts(images, posts) {
 	});
 }
 
-function writeFiles(posts) {
+function writeFiles(categorizedData) {
 	let delay = 0;
-	posts.forEach(post => {
-		const postDir = getPostDir(post);
-		createDir(postDir);
-		writeMarkdownFile(post, postDir);
+	const ids = Object.keys(categorizedData);
 
-		if (argv.saveimages && post.meta.imageUrls) {
-			post.meta.imageUrls.forEach(imageUrl => {
-				const imageDir = path.join(postDir, 'images');
-				createDir(imageDir);
-				writeImageFile(imageUrl, imageDir, delay);
-				delay += 25;
-			});
+	ids.forEach(id => {
+		let categoryDir;
+
+		if (categorizedData[id].category) {
+
+			const baseDir = argv.output;
+			const categoryDir = path.join(baseDir, categorizedData[id].category);
+			createDir(categoryDir);
+
+			const postDir = getPostDir(categorizedData[id].post, categoryDir);
+			createDir(postDir);
+			writeMarkdownFile(categorizedData[id].post, postDir);
+
+			if (argv.saveimages && categorizedData[id].post.meta.imageUrls) {
+				categorizedData[id].post.meta.imageUrls.forEach(imageUrl => {
+					const imageDir = path.join(postDir, 'images');
+					createDir(imageDir);
+					writeImageFile(imageUrl, imageDir, delay);
+					delay += 25;
+				});
+			}
+
 		}
 	});
 }
@@ -292,8 +334,8 @@ function writeMarkdownFile(post, postDir) {
 		.reduce((accumulator, pair) => {
 			return accumulator + pair[0] + ': "' + pair[1] + '"\n'
 		}, '');
-	const data = '---\n' + frontmatter + '---\n\n' + post.content + '\n';
-	
+	const data = post.content + '\n';
+
 	const postPath = path.join(postDir, getPostFilename(post));
 	fs.writeFile(postPath, data, (err) => {
 		if (err) {
@@ -306,7 +348,12 @@ function writeMarkdownFile(post, postDir) {
 }
 
 function writeImageFile(imageUrl, imageDir, delay) {
-	let imagePath = path.join(imageDir, getFilenameFromUrl(imageUrl));
+	console.log(imageUrl);
+	let imageFilename = imageUrl.split('/').slice(-1)[0];
+	if (imageFilename.indexOf('?') !== -1) {
+		imageFilename = imageFilename.split('?')[0];
+	}
+	let imagePath = path.join(imageDir, imageFilename);
 	let stream = fs.createWriteStream(imagePath);
 	stream.on('finish', () => {
 		console.log('Saved ' + imagePath + '.');
@@ -341,8 +388,8 @@ function createDir(dir) {
 	}
 }
 
-function getPostDir(post) {
-	let dir = argv.output;
+function getPostDir(post, category) {
+	let dir = category;
 	let dt = luxon.DateTime.fromISO(post.frontmatter.date);
 
 	if (argv.yearmonthfolders) {
@@ -352,7 +399,7 @@ function getPostDir(post) {
 	}
 
 	if (argv.postfolders) {
-		let folder = post.meta.slug;
+		let folder = decodeURI(post.meta.slug);
 		if (argv.prefixdate) {
 			folder = dt.toFormat('yyyy-LL-dd') + '-' + folder;
 		}
